@@ -19,7 +19,10 @@ function isAudioSource(node) {
 }
 
 function listSnapshot(list) {
-  return list && list.slice ? list.slice() : []
+  var snapshot = []
+  if (!list || typeof list.length !== "number") return snapshot
+  for (var i = 0; i < list.length; i++) snapshot.push(list[i])
+  return snapshot
 }
 
 function outputVolumeName(volume, muted) {
@@ -189,7 +192,10 @@ function rememberCastSpeakers(speakers, remembered) {
 function rememberedCastReconnectKeys(speakers, remembered, nodes) {
   var current = Array.isArray(speakers) ? speakers : []
   var previous = Array.isArray(remembered) ? remembered : []
-  var nativeSinks = Array.isArray(nodes) ? nodes : []
+  // Quickshell exposes Pipewire.nodes.values as an indexable list, not a real
+  // JavaScript Array. Copy it before matching so reconnect protection also runs
+  // in the live shell rather than only in Node-based tests.
+  var nativeSinks = listSnapshot(nodes)
   var present = {}
   var keys = []
 

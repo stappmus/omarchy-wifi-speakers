@@ -48,11 +48,12 @@ assert.equal(Model.castSpeakerForNativeSink([matchingCast, otherCast], airPlaySi
 assert.equal(Model.castSpeakerForNativeSink([otherCast], airPlaySink), null)
 const remembered = Model.rememberCastSpeakers([matchingCast], [otherCast])
 assert.deepEqual(remembered, [otherCast, matchingCast])
+const quickshellNodes = {0: airPlaySink, length: 1}
 assert.deepEqual(
-  Model.rememberedCastReconnectKeys([], remembered, [airPlaySink]),
+  Model.rememberedCastReconnectKeys([], remembered, quickshellNodes),
   ["cast:cast-id"]
 )
-const reconnecting = Model.wifiSpeakerCandidates([], remembered, [airPlaySink], true)
+const reconnecting = Model.wifiSpeakerCandidates([], remembered, quickshellNodes, true)
 assert.equal(reconnecting.length, 1)
 assert.equal(reconnecting[0].speakerId, matchingCast.speakerId)
 assert.equal(reconnecting[0].available, false)
