@@ -1,31 +1,29 @@
-# Wi-Fi Speakers for Omarchy Quattro
+# Audio + Wi-Fi for Omarchy Quattro
 
-A native Quickshell overlay for live-discovered Google Cast and AirPlay audio
-receivers. It keeps discovery out of the UI process, uses one atomic cache, and
-routes applications through Omarchy's current PipeWire output helper.
+Omarchy's Audio bar widget with network outputs built into the ordinary Audio
+panel. AirPlay receivers use PipeWire's native RAOP support. Google Cast is
+available as a managed fallback when the same receiver is not already exposed
+as an AirPlay sink.
 
-Unlike the original local backend, this version does not require EasyEffects or
-assume a sink named `easyeffects_sink`. It works with Quattro's
-`omarchy_speaker_tuning`, headphones, HDMI, or an unprocessed default sink and
-restores whichever output was active before the Wi-Fi route.
+There is no standalone speaker chooser.
 
-![Omarchy Audio panel showing a Wi-Fi receiver beside the laptop output](preview.png)
+![Omarchy Audio panel showing a network receiver beside the laptop output](preview.png)
 
-When a network receiver is available as a PipeWire output, it appears alongside
-local devices in Omarchy's built-in Audio panel.
+The plugin is a clone replacement for `omarchy.audio`, so the existing volume
+icon, `SUPER + CTRL + A`, and `omarchy-shell shell toggle omarchy.audio` all
+open this panel.
 
 ## Install
 
-Install runtime dependencies and the plugin:
-
 ```bash
-omarchy pkg add avahi ffmpeg iproute2 jq pipewire-pulse python-pychromecast
+omarchy pkg add avahi ffmpeg iproute2 jq pipewire-pulse pipewire-zeroconf python-pychromecast
 omarchy plugin add https://github.com/stappmus/omarchy-wifi-speakers.git --enable
-~/.config/omarchy/plugins/stappmus.wifi-speakers/setup.sh
+~/.config/omarchy/plugins/stappmus.audio/setup.sh
 ```
 
-The final command links and enables the included user discovery service. It
-refuses to replace an unrelated service file.
+The setup command enables native RAOP discovery and links the included user
+service for Cast/AirPlay discovery. It preserves unrelated PipeWire and systemd
+files instead of replacing them.
 
 If UFW is active, allow only private-network receivers to reach the streaming
 ports used by Cast and AirPlay:
@@ -39,45 +37,45 @@ sudo ufw allow proto udp from 172.16.0.0/12 to any port 6001:6129 comment allow-
 sudo ufw allow proto udp from 192.168.0.0/16 to any port 6001:6129 comment allow-stappmus-airplay-audio
 ```
 
-Open the plugin's standalone selector with:
+### Migrating from the 1.0 standalone selector
 
 ```bash
-~/.config/omarchy/plugins/stappmus.wifi-speakers/scripts/open-overlay
+systemctl --user disable --now omarchy-audio-speaker-discovery.service
+unit=~/.config/systemd/user/omarchy-audio-speaker-discovery.service
+[[ -L $unit ]] && unlink "$unit"
+systemctl --user daemon-reload
+omarchy plugin remove stappmus.wifi-speakers
+omarchy plugin add https://github.com/stappmus/omarchy-wifi-speakers.git --enable
+~/.config/omarchy/plugins/stappmus.audio/setup.sh
 ```
 
-The optional [`extras/wifi-speakers.lua`](extras/wifi-speakers.lua) shows the
-Quattro bindings used for the selector and route-aware volume keys. Copy it to
-`~/.config/hypr/`, then add this to `~/.config/hypr/bindings.lua`:
-
-```lua
-require("hypr.wifi-speakers")
-```
-
-The two shell wrappers in `extras/` are compatibility shims for older local
-bindings that referenced `~/.local/bin`; new installations do not need them.
+Remove any old `SUPER + XF86AudioMute` selector binding. The Audio panel's
+standard shortcut is `SUPER + CTRL + A`. To keep the hardware volume keys
+synchronized with a Cast receiver, copy
+[`extras/wifi-speakers.lua`](extras/wifi-speakers.lua) into `~/.config/hypr/`,
+add `require("hypr.wifi-speakers")` to `~/.config/hypr/bindings.lua`, and run
+`hyprctl reload`. That module contains volume bindings only.
 
 ## How routing works
 
-- Discovery keeps two targeted Avahi browsers alive and reconciles a coherent
-  snapshot periodically. Identical status and speaker generations are not
-  rewritten.
-- The overlay itself is loaded only while open; closing it releases its QML
-  model and file watchers while discovery continues in the small user service.
-- Cast creates a temporary null sink, moves only real application streams to
-  it, and serves its monitor on TCP port 49785. Receiver volume is controlled
-  over a local Unix socket.
-- AirPlay creates a transient PipeWire RAOP sink and selects it with Omarchy's
-  standard output helper.
-- Disconnecting stops the transient user service, removes the temporary sink,
-  and restores the exact previous default output.
+- Native AirPlay sinks stay ordinary PipeWire outputs and appear once in the
+  Audio panel. A matching Cast discovery record is suppressed to avoid showing
+  the same receiver twice.
+- Cast creates a temporary null sink, moves real application streams to it,
+  and serves the monitor only to the selected receiver on TCP port 49785.
+- Receiver volume is controlled through a local Unix socket. Selecting a local
+  output cancels and removes the network route before switching sinks.
+- The discovery service writes one atomic cache; the Audio panel watches that
+  file instead of running network scans in its UI process.
+- Disconnecting restores the exact output that was active before the network
+  route. No EasyEffects sink name or other fixed DSP graph is assumed.
 
-Only the selected Cast receiver's IP may fetch its generated stream URL. Route
-state and control sockets live under the user's runtime directory.
+Runtime state and control sockets live under the user's runtime directory.
 
 ## CLI
 
 ```bash
-plugin=~/.config/omarchy/plugins/stappmus.wifi-speakers
+plugin=~/.config/omarchy/plugins/stappmus.audio
 $plugin/scripts/audio-output list --json
 $plugin/scripts/audio-output current --json
 $plugin/scripts/audio-output connect SPEAKER_ID cast
@@ -87,25 +85,25 @@ $plugin/scripts/audio-output volume raise
 
 ## Remove
 
-Disable the discovery service before removing the plugin:
-
 ```bash
+~/.config/omarchy/plugins/stappmus.audio/scripts/audio-output internal
 systemctl --user disable --now omarchy-audio-speaker-discovery.service
 unit=~/.config/systemd/user/omarchy-audio-speaker-discovery.service
 [[ -L $unit ]] && unlink "$unit"
 systemctl --user daemon-reload
-omarchy plugin remove stappmus.wifi-speakers
+omarchy plugin remove stappmus.audio
 ```
+
+Removing this clone restores Omarchy's built-in `omarchy.audio` widget.
 
 ## Test
 
 ```bash
 ./test/run.sh
-qmllint -I /usr/share/omarchy/shell WifiSpeakers.qml
 omarchy plugin validate .
 ```
 
-The mock route tests do not change the host's real PipeWire graph. A physical
-Cast or AirPlay receiver is still required for a complete end-to-end test.
+The mock route tests do not modify the host's real PipeWire graph. A physical
+receiver is still required for a complete end-to-end Cast or AirPlay test.
 
 Licensed under the MIT License.

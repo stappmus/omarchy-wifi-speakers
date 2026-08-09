@@ -1,15 +1,24 @@
 {
   "schemaVersion": 1,
-  "id": "stappmus.wifi-speakers",
-  "name": "Wi-Fi Speakers",
-  "version": "1.0.0",
+  "id": "stappmus.audio",
+  "name": "Audio + Wi-Fi",
+  "version": "1.1.0",
   "author": "Kristoffer Haugland",
   "license": "MIT",
-  "description": "Live-discovered Google Cast and AirPlay audio output selector for Omarchy Quattro",
+  "description": "Omarchy Audio panel with native AirPlay and Google Cast outputs",
   "kinds": [
-    "overlay"
+    "bar-widget"
   ],
   "entryPoints": {
-    "overlay": "WifiSpeakers.qml"
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Audio + Wi-Fi",
+    "description": "Volume, inputs, app mixer, AirPlay, and Google Cast",
+    "category": "Audio",
+    "allowMultiple": false
+  },
+  "omarchy": {
+    "clonedFrom": "omarchy.audio"
   }
 }

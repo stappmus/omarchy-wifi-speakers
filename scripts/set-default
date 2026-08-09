@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Switch back to a normal PipeWire sink and tear down any managed network route.
+
+set -euo pipefail
+
+readonly script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+node_id=${1:-}
+sink_name=${2:-}
+if [[ -z $node_id || -z $sink_name ]]; then
+  echo "Usage: set-default NODE_ID SINK_NAME" >&2
+  exit 2
+fi
+
+"$script_dir/audio-route" disconnect "$sink_name"
+exec omarchy-audio-output-set-default "$node_id" "$sink_name"

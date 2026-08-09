@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-"""Maintain the runtime cache used by Omarchy's Wi-Fi speaker menu."""
+"""Maintain the runtime cache used by Omarchy's Audio panel."""
 
 from __future__ import annotations
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# User-facing backend for the Wi-Fi Speakers overlay.
+# Route backend for the Audio panel's network outputs.
 
 set -euo pipefail
 
