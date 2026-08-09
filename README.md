@@ -9,6 +9,11 @@ assume a sink named `easyeffects_sink`. It works with Quattro's
 `omarchy_speaker_tuning`, headphones, HDMI, or an unprocessed default sink and
 restores whichever output was active before the Wi-Fi route.
 
+![Omarchy Audio panel showing a Wi-Fi receiver beside the laptop output](preview.png)
+
+When a network receiver is available as a PipeWire output, it appears alongside
+local devices in Omarchy's built-in Audio panel.
+
 ## Install
 
 Install runtime dependencies and the plugin:
@@ -34,7 +39,7 @@ sudo ufw allow proto udp from 172.16.0.0/12 to any port 6001:6129 comment allow-
 sudo ufw allow proto udp from 192.168.0.0/16 to any port 6001:6129 comment allow-stappmus-airplay-audio
 ```
 
-Open the overlay with:
+Open the plugin's standalone selector with:
 
 ```bash
 ~/.config/omarchy/plugins/stappmus.wifi-speakers/scripts/open-overlay
