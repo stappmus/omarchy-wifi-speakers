@@ -1,0 +1,144 @@
+#!/bin/bash
+
+# User-facing backend for the Wi-Fi Speakers overlay.
+
+set -euo pipefail
+
+readonly script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+readonly cache_dir="$runtime_dir/omarchy-wifi-speakers"
+readonly speaker_cache="$cache_dir/speakers.tsv"
+readonly snapshot_file="$cache_dir/snapshot.json"
+readonly route_helper="$script_dir/audio-route"
+
+current_output() {
+  local format=${1:-text} state kind speaker_id label status
+  state=$($route_helper status 2>/dev/null) || state='{}'
+  kind=$(jq -r '.kind // "internal"' <<<"$state")
+  speaker_id=$(jq -r '.speakerId // ""' <<<"$state")
+  label=$(jq -r '.label // ""' <<<"$state")
+  status=$(jq -r '.status // "inactive"' <<<"$state")
+  if [[ $kind == internal ]]; then
+    speaker_id=""
+    label="Internal speakers"
+  elif [[ -z $label ]]; then
+    label="Wi-Fi speaker"
+  fi
+
+  if [[ $format == json || $format == --json ]]; then
+    jq -cn \
+      --arg kind "$kind" \
+      --arg speakerId "$speaker_id" \
+      --arg label "$label" \
+      --arg status "$status" \
+      '{schemaVersion:1,kind:$kind,speakerId:$speakerId,label:$label,status:$status}'
+  else
+    printf '%s\t%s\t%s\t%s\n' "$kind" "$speaker_id" "$label" "$status"
+  fi
+}
+
+speaker_record() {
+  local requested_id=$1 requested_protocol=${2:-}
+  local speaker_id label protocol service_name host address port transport encryption_codec model
+  local match="" matches=0
+
+  [[ -r $speaker_cache ]] || return 1
+  while IFS=$'\t' read -r speaker_id label protocol service_name host address port transport encryption_codec model; do
+    [[ $speaker_id == "$requested_id" ]] || continue
+    [[ -z $requested_protocol || $protocol == "$requested_protocol" ]] || continue
+    match=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+      "$speaker_id" "$label" "$protocol" "$service_name" "$host" \
+      "$address" "$port" "$transport" "$encryption_codec" "$model")
+    ((matches += 1))
+  done <"$speaker_cache"
+
+  ((matches == 1)) || return 1
+  printf '%s\n' "$match"
+}
+
+connect_speaker() {
+  local requested_id=${1:-} requested_protocol=${2:-} record
+  local speaker_id label protocol service_name host address port transport encryption_codec model
+  [[ -n $requested_id ]] || {
+    echo "Usage: audio-output connect SPEAKER_ID [cast|raop]" >&2
+    return 2
+  }
+
+  record=$(speaker_record "$requested_id" "$requested_protocol") || {
+    echo "Wi-Fi speaker is unavailable or ambiguous: $requested_id" >&2
+    return 1
+  }
+  IFS=$'\t' read -r speaker_id label protocol service_name host address port transport encryption_codec model \
+    <<<"$record"
+
+  case $protocol in
+    cast)
+      exec "$route_helper" connect cast \
+        "$speaker_id" "$label" "$address" "$port" "$model"
+      ;;
+    raop)
+      exec "$route_helper" connect raop \
+        "$speaker_id" "$label" "$service_name" "$host" "$address" "$port" \
+        "$transport" "$encryption_codec" "$model"
+      ;;
+    *)
+      echo "Unsupported Wi-Fi speaker protocol: $protocol" >&2
+      return 1
+      ;;
+  esac
+}
+
+adjust_volume() {
+  local state kind response percent muted icon
+  state=$($route_helper status 2>/dev/null) || state='{}'
+  kind=$(jq -r '.kind // "internal"' <<<"$state")
+  if [[ $kind != cast ]]; then
+    exec omarchy-audio-output-volume "$@"
+  fi
+
+  response=$("$script_dir/cast-volume" "$@")
+  percent=$(jq -r '((.volume // 0) * 100) | round' <<<"$response")
+  muted=$(jq -r '.muted // false' <<<"$response")
+  if [[ $muted == true || $percent -eq 0 ]]; then
+    icon=volume-muted
+  else
+    icon=volume-high
+  fi
+  omarchy-osd -i "$icon" -p "$percent" >/dev/null 2>&1 || true
+  printf '%s\n' "$response"
+}
+
+command=${1:-}
+case $command in
+  current)
+    current_output "${2:-text}"
+    ;;
+  connect)
+    connect_speaker "${2:-}" "${3:-}"
+    ;;
+  internal|disconnect)
+    exec "$route_helper" disconnect
+    ;;
+  volume)
+    shift
+    [[ $# -gt 0 ]] || {
+      echo "Usage: audio-output volume <raise|lower|mute-toggle|+N|-N>" >&2
+      exit 2
+    }
+    adjust_volume "$@"
+    ;;
+  list)
+    if [[ ${2:-} == --json ]]; then
+      [[ -r $snapshot_file ]] && cat "$snapshot_file" || printf '{"schemaVersion":1,"status":"scanning","speakers":[]}\n'
+    else
+      [[ -r $speaker_cache ]] && cat "$speaker_cache"
+    fi
+    ;;
+  status)
+    exec "$route_helper" status
+    ;;
+  *)
+    echo "Usage: audio-output <current [--json]|connect ID [cast|raop]|internal|list [--json]|volume ACTION|status>" >&2
+    exit 2
+    ;;
+esac

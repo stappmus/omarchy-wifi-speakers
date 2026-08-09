@@ -1,0 +1,549 @@
+#!/usr/bin/python
+
+# omarchy:summary=Stream a PipeWire monitor to a Google Cast receiver
+# omarchy:group=audio
+# omarchy:args=<Cast stream options>
+
+"""Serve a PipeWire/Pulse monitor to one Google Cast receiver."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import http.server
+import ipaddress
+import json
+import os
+import signal
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import uuid
+from pathlib import Path
+from typing import NamedTuple
+
+import pychromecast
+from pychromecast.error import PyChromecastError
+
+
+class AudioFormat(NamedTuple):
+    name: str
+    suffix: str
+    content_type: str
+    ffmpeg_args: tuple[str, ...]
+
+
+AUDIO_FORMATS = (
+    AudioFormat(
+        "PCM WAV",
+        ".wav",
+        "audio/wav",
+        ("-codec:a", "pcm_s16le", "-flush_packets", "1", "-f", "wav"),
+    ),
+    AudioFormat(
+        "MP3",
+        ".mp3",
+        "audio/mpeg",
+        (
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-write_xing",
+            "0",
+            "-id3v2_version",
+            "0",
+            "-flush_packets",
+            "1",
+            "-f",
+            "mp3",
+        ),
+    ),
+)
+
+
+def fallback_format_index(current: int, connected_once: bool) -> int | None:
+    if not connected_once and current + 1 < len(AUDIO_FORMATS):
+        return current + 1
+    return None
+
+
+class StreamState:
+    def __init__(self) -> None:
+        self.stopping = threading.Event()
+        self.lock = threading.Lock()
+        self.processes: set[subprocess.Popen[bytes]] = set()
+
+    def add(self, process: subprocess.Popen[bytes]) -> None:
+        with self.lock:
+            self.processes.add(process)
+
+    def remove(self, process: subprocess.Popen[bytes]) -> None:
+        with self.lock:
+            self.processes.discard(process)
+
+    def terminate_all(self) -> None:
+        with self.lock:
+            processes = list(self.processes)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        for process in processes:
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            self.remove(process)
+
+
+class StreamTarget:
+    def __init__(self, audio_format: AudioFormat, receiver_address: str) -> None:
+        self.audio_format = audio_format
+        self.receiver_address = ipaddress.ip_address(receiver_address)
+        self.connected = threading.Event()
+        self.disconnected = threading.Event()
+        self.client_lock = threading.Lock()
+        self.client_active = False
+
+    def allows(self, address: str) -> bool:
+        try:
+            return ipaddress.ip_address(address) == self.receiver_address
+        except ValueError:
+            return False
+
+    def claim(self, address: str) -> bool:
+        if not self.allows(address):
+            return False
+        with self.client_lock:
+            if self.client_active:
+                return False
+            self.client_active = True
+            return True
+
+    def release(self) -> None:
+        with self.client_lock:
+            self.client_active = False
+
+
+class VolumeController:
+    def __init__(
+        self,
+        cast: pychromecast.Chromecast,
+        state: StreamState,
+        state_file: Path,
+        speaker_id: str,
+    ) -> None:
+        self.cast = cast
+        self.state = state
+        self.state_file = state_file
+        self.speaker_id = speaker_id
+        self.lock = threading.Lock()
+        self.changed = threading.Event()
+        self.pending = False
+        status_volume = getattr(cast.status, "volume_level", None)
+        status_muted = getattr(cast.status, "volume_muted", None)
+        self.volume = float(status_volume if status_volume is not None else 1)
+        self.muted = bool(status_muted if status_muted is not None else False)
+        self.persist()
+
+    def snapshot(self) -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "speakerId": self.speaker_id,
+            "volume": self.volume,
+            "muted": self.muted,
+        }
+
+    def persist(self) -> None:
+        self.state_file.write_text(json.dumps(self.snapshot()) + "\n", encoding="utf-8")
+
+    def new_cast_status(self, status: object) -> None:
+        volume = getattr(status, "volume_level", None)
+        muted = getattr(status, "volume_muted", None)
+        if volume is None or muted is None:
+            return
+        with self.lock:
+            if self.pending:
+                return
+            volume = float(volume)
+            muted = bool(muted)
+            if abs(self.volume - volume) < 0.0005 and self.muted == muted:
+                return
+            self.volume = volume
+            self.muted = muted
+            self.persist()
+
+    def apply(self, request: dict[str, object]) -> dict[str, object]:
+        action = request.get("action")
+        with self.lock:
+            if action == "set":
+                self.volume = max(0, min(1, float(request.get("value", self.volume))))
+            elif action == "adjust":
+                self.volume = max(
+                    0, min(1, self.volume + float(request.get("value", 0)))
+                )
+                if request.get("unmute"):
+                    self.muted = False
+            elif action == "mute-toggle":
+                self.muted = not self.muted
+            elif action == "mute":
+                self.muted = bool(request.get("value"))
+            elif action != "get":
+                raise ValueError("unknown volume action")
+
+            if action != "get":
+                self.pending = True
+                self.persist()
+                self.changed.set()
+            return self.snapshot()
+
+    def run(self) -> None:
+        while not self.state.stopping.is_set():
+            if not self.changed.wait(1):
+                continue
+            self.changed.clear()
+            with self.lock:
+                volume = self.volume
+                muted = self.muted
+            try:
+                self.cast.set_volume(volume, timeout=3)
+                self.cast.set_volume_muted(muted, timeout=3)
+            except (OSError, PyChromecastError) as error:
+                print(
+                    f"cast volume update failed, retrying: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if not self.state.stopping.wait(2):
+                    self.changed.set()
+                continue
+            with self.lock:
+                if self.volume == volume and self.muted == muted:
+                    self.pending = False
+                    self.persist()
+
+
+def make_volume_handler(
+    controller: VolumeController,
+) -> type[socketserver.StreamRequestHandler]:
+    class VolumeHandler(socketserver.StreamRequestHandler):
+        def handle(self) -> None:
+            try:
+                request = json.loads(self.rfile.readline().decode("utf-8"))
+                response = controller.apply(request)
+            except (TypeError, ValueError) as error:
+                response = {"error": str(error)}
+            self.wfile.write((json.dumps(response) + "\n").encode("utf-8"))
+
+    return VolumeHandler
+
+
+class VolumeServer(socketserver.ThreadingUnixStreamServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def local_address_for(host: str, port: int) -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect((host, port))
+        return str(sock.getsockname()[0])
+
+
+def make_handler(
+    state: StreamState,
+    source: str,
+    streams: dict[str, StreamTarget],
+) -> type[http.server.BaseHTTPRequestHandler]:
+    class StreamHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            print(f"http: {fmt % args}", flush=True)
+
+        def stream_target(self) -> StreamTarget | None:
+            return streams.get(urllib.parse.urlsplit(self.path).path)
+
+        def do_HEAD(self) -> None:
+            target = self.stream_target()
+            if target is None or not target.allows(self.client_address[0]):
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", target.audio_format.content_type)
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.end_headers()
+
+        def do_GET(self) -> None:
+            target = self.stream_target()
+            if target is None or not target.allows(self.client_address[0]):
+                self.send_error(404)
+                return
+            if not target.claim(self.client_address[0]):
+                self.send_error(409)
+                return
+
+            process = None
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", target.audio_format.content_type)
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+
+                process = subprocess.Popen(
+                    [
+                        "/usr/bin/ffmpeg",
+                        "-nostdin",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-f",
+                        "pulse",
+                        "-i",
+                        source,
+                        "-map",
+                        "0:a:0",
+                        "-ac",
+                        "2",
+                        "-ar",
+                        "48000",
+                        *target.audio_format.ffmpeg_args,
+                        "pipe:1",
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    bufsize=0,
+                )
+                state.add(process)
+                assert process.stdout is not None
+                while not state.stopping.is_set():
+                    chunk = process.stdout.read(8192)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    target.connected.set()
+            except OSError:
+                pass
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    state.remove(process)
+                target.release()
+                target.disconnected.set()
+
+    return StreamHandler
+
+
+class StreamServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def arguments() -> argparse.Namespace:
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", required=True)
+    parser.add_argument("--port", required=True, type=int)
+    parser.add_argument("--uuid", required=True)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--model", default="Google Cast speaker")
+    parser.add_argument("--source", required=True)
+    parser.add_argument("--listen-port", type=int, default=49785)
+    parser.add_argument("--ready-file", required=True)
+    parser.add_argument(
+        "--volume-state-file",
+        default=str(runtime_dir / "omarchy-audio-cast-volume.json"),
+    )
+    parser.add_argument(
+        "--volume-socket",
+        default=str(runtime_dir / "omarchy-audio-cast-volume.sock"),
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = arguments()
+    state = StreamState()
+    ready_file = Path(args.ready_file)
+    ready_file.unlink(missing_ok=True)
+    cast = None
+    server = None
+    volume_controller = None
+    volume_server = None
+    volume_thread = None
+    stream_url = ""
+    volume_state_file = Path(args.volume_state_file)
+    volume_socket = Path(args.volume_socket)
+    volume_state_file.unlink(missing_ok=True)
+    volume_socket.unlink(missing_ok=True)
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        state.stopping.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    try:
+        local_ip = local_address_for(args.host, args.port)
+        receiver_ip = socket.gethostbyname(args.host)
+        stream_id = uuid.uuid4().hex
+        streams: dict[str, StreamTarget] = {}
+        server = StreamServer(
+            (local_ip, args.listen_port),
+            make_handler(state, args.source, streams),
+        )
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        cast = pychromecast.get_chromecast_from_host(
+            (args.host, args.port, uuid.UUID(args.uuid), args.model, args.name),
+            tries=3,
+            retry_wait=1,
+            timeout=5,
+        )
+        cast.wait(timeout=10)
+        volume_controller = VolumeController(cast, state, volume_state_file, args.uuid)
+        cast.register_status_listener(volume_controller)
+        volume_thread = threading.Thread(target=volume_controller.run, daemon=True)
+        volume_thread.start()
+        volume_server = VolumeServer(
+            str(volume_socket),
+            make_volume_handler(volume_controller),
+        )
+        threading.Thread(target=volume_server.serve_forever, daemon=True).start()
+
+        media = cast.media_controller
+        format_index = 0
+        connected_once = False
+        attempt = 0
+
+        while not state.stopping.is_set():
+            attempt += 1
+            audio_format = AUDIO_FORMATS[format_index]
+            stream_path = f"/omarchy-audio-{stream_id}-{attempt}{audio_format.suffix}"
+            stream_url = f"http://{local_ip}:{args.listen_port}{stream_path}"
+            target = StreamTarget(audio_format, receiver_ip)
+            streams[stream_path] = target
+            try:
+                media.play_media(
+                    stream_url,
+                    audio_format.content_type,
+                    title="System audio",
+                    stream_type="LIVE",
+                )
+                media.block_until_active(timeout=10)
+
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if target.disconnected.is_set():
+                        raise RuntimeError("speaker closed the audio stream")
+                    if (
+                        target.connected.is_set()
+                        and media.status.content_id == stream_url
+                        and media.status.player_state in {"PLAYING", "BUFFERING"}
+                    ):
+                        break
+                    if state.stopping.wait(0.1):
+                        raise RuntimeError("stream startup was cancelled")
+                else:
+                    raise RuntimeError("speaker did not start the audio stream")
+            except (OSError, PyChromecastError, RuntimeError, TypeError) as error:
+                with contextlib.suppress(OSError, PyChromecastError):
+                    if media.status.content_id == stream_url:
+                        media.stop(timeout=3)
+                state.terminate_all()
+                streams.pop(stream_path, None)
+                stream_url = ""
+                if state.stopping.is_set():
+                    raise RuntimeError("stream startup was cancelled") from error
+
+                fallback_index = fallback_format_index(format_index, connected_once)
+                if fallback_index is not None:
+                    print(
+                        f"{audio_format.name} startup failed, trying "
+                        f"{AUDIO_FORMATS[fallback_index].name}: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    format_index = fallback_index
+                    continue
+                if not connected_once:
+                    raise RuntimeError(
+                        f"speaker rejected every audio format: {error}"
+                    ) from error
+
+                print(
+                    f"{audio_format.name} reconnect failed, retrying: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if state.stopping.wait(2):
+                    break
+                continue
+
+            connected_once = True
+            ready_file.write_text(stream_url + "\n", encoding="utf-8")
+            print(
+                f"streaming {audio_format.name} to {args.name} at {stream_url}",
+                flush=True,
+            )
+
+            while not state.stopping.wait(1):
+                if target.disconnected.is_set():
+                    break
+            if state.stopping.is_set():
+                break
+
+            ready_file.unlink(missing_ok=True)
+            state.terminate_all()
+            streams.pop(stream_path, None)
+            print(
+                f"{audio_format.name} stream ended, reconnecting",
+                file=sys.stderr,
+                flush=True,
+            )
+            if state.stopping.wait(2):
+                break
+
+        return 0
+    except (OSError, PyChromecastError, RuntimeError, TypeError, ValueError) as error:
+        print(f"cast stream failed: {error}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        ready_file.unlink(missing_ok=True)
+        state.stopping.set()
+        if volume_controller is not None:
+            volume_controller.changed.set()
+        if volume_server is not None:
+            volume_server.shutdown()
+            volume_server.server_close()
+        volume_socket.unlink(missing_ok=True)
+        if volume_thread is not None:
+            volume_thread.join(timeout=3)
+        if cast is not None:
+            with contextlib.suppress(OSError, PyChromecastError):
+                media = cast.media_controller
+                if media.status.content_id == stream_url:
+                    media.stop(timeout=3)
+            with contextlib.suppress(OSError, PyChromecastError):
+                cast.disconnect(timeout=3)
+        volume_state_file.unlink(missing_ok=True)
+        state.terminate_all()
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

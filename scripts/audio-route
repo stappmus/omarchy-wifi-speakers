@@ -1,0 +1,326 @@
+#!/bin/bash
+
+# Manage transient Google Cast and AirPlay sinks without assuming a particular
+# Omarchy DSP graph. Applications are moved through Omarchy's stock output
+# helper, so speaker tuning, headphones, and HDMI all restore correctly.
+
+set -euo pipefail
+
+readonly script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+readonly runtime_dir="${XDG_RUNTIME_DIR:-/run/user/$UID}"
+readonly state_file="$runtime_dir/omarchy-audio-wifi.state"
+readonly lock_file="$runtime_dir/omarchy-audio-wifi.lock"
+readonly cancel_file="$runtime_dir/omarchy-audio-wifi.cancel"
+readonly cast_port=49785
+readonly cast_volume_state="$runtime_dir/omarchy-audio-cast-volume.json"
+readonly cast_volume_socket="$runtime_dir/omarchy-audio-cast-volume.sock"
+
+pending_unit=""
+pending_ready=""
+pending_module=""
+pending_state_tmp=""
+route_committed=0
+
+safe_id() {
+  printf '%s' "$1" | tr -cd '[:alnum:]' | tr '[:upper:]' '[:lower:]'
+}
+
+spa_escape() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '%s' "$value"
+}
+
+node_id_for_sink() {
+  local sink=$1 node_id
+  node_id=$(timeout 2 pw-dump 2>/dev/null | jq -r --arg sink "$sink" '
+    [.[] | select(
+      .type == "PipeWire:Interface:Node" and
+      .info.props["node.name"] == $sink
+    )] | first | .id // empty
+  ')
+  printf '%s\n' "$node_id"
+}
+
+sink_exists() {
+  local sink=$1
+  pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "$sink"
+}
+
+select_sink() {
+  local sink=$1 node_id
+  node_id=$(node_id_for_sink "$sink")
+  [[ -n $node_id ]] || return 1
+  omarchy-audio-output-set-default "$node_id" "$sink"
+}
+
+load_state() {
+  state_kind=""
+  state_unit=""
+  state_sink=""
+  state_previous=""
+  state_id=""
+  state_label=""
+  state_module=""
+  [[ -r $state_file ]] || return 1
+  IFS=$'\t' read -r state_kind state_unit state_sink state_previous state_id state_label state_module \
+    <"$state_file" || true
+
+  case $state_kind in
+    cast)
+      [[ $state_unit =~ ^omarchy-audio-cast-[[:alnum:]]+\.service$ \
+        && $state_sink =~ ^omarchy_wifi_cast_[[:alnum:]]+$ ]]
+      ;;
+    raop)
+      [[ $state_unit =~ ^omarchy-audio-raop-[[:alnum:]]+\.service$ \
+        && $state_sink =~ ^raop_sink\.stappmus_wifi_[[:alnum:]]+$ ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+stop_route() {
+  local target=${1:-}
+  load_state || return 0
+  [[ -n $target ]] || target=$state_previous
+
+  if [[ -n $target ]] && sink_exists "$target"; then
+    select_sink "$target" || true
+  fi
+
+  rm -f -- "$state_file"
+  systemctl --user stop "$state_unit" >/dev/null 2>&1 || true
+  if [[ $state_kind == cast ]]; then
+    rm -f -- "$cast_volume_state" "$cast_volume_socket"
+  fi
+  if [[ $state_module =~ ^[0-9]+$ ]]; then
+    pactl unload-module "$state_module" >/dev/null 2>&1 || true
+  fi
+
+  # WirePlumber can react to removal of the old default after the transient
+  # sink disappears. Reassert the surviving output once cleanup is complete.
+  if [[ -n $target ]] && sink_exists "$target"; then
+    select_sink "$target" || true
+  fi
+}
+
+cleanup_pending() {
+  local exit_code=$?
+  trap - EXIT
+
+  if ((route_committed == 0)) && [[ -n $pending_unit || -n $pending_module ]]; then
+    [[ -z $pending_ready ]] || rm -f -- "$pending_ready"
+    [[ -z $pending_state_tmp ]] || rm -f -- "$pending_state_tmp"
+    [[ -z $pending_unit ]] || systemctl --user stop "$pending_unit" >/dev/null 2>&1 || true
+    rm -f -- "$cast_volume_state" "$cast_volume_socket"
+    if [[ $pending_module =~ ^[0-9]+$ ]]; then
+      pactl unload-module "$pending_module" >/dev/null 2>&1 || true
+    fi
+    if load_state && [[ $state_unit == "$pending_unit" ]]; then
+      rm -f -- "$state_file"
+    fi
+  fi
+
+  exit "$exit_code"
+}
+
+trap cleanup_pending EXIT
+trap 'exit 130' HUP INT TERM
+
+commit_state() {
+  local kind=$1 unit=$2 sink=$3 previous=$4 speaker_id=$5 label=$6 module=${7:-}
+  local state_tmp
+  state_tmp=$(mktemp "$runtime_dir/omarchy-audio-wifi.state.XXXXXX")
+  pending_state_tmp=$state_tmp
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$kind" "$unit" "$sink" "$previous" "$speaker_id" "$label" "$module" \
+    >"$state_tmp"
+  mv -- "$state_tmp" "$state_file"
+  pending_state_tmp=""
+}
+
+start_cast() {
+  local speaker_id=$1 label=$2 address=$3 port=$4 model=$5 previous=$6
+  local id sink unit ready attempt
+  id=$(safe_id "$speaker_id")
+  [[ -n $id ]] || id=receiver
+  sink="omarchy_wifi_cast_$id"
+  unit="omarchy-audio-cast-$id.service"
+  ready="$runtime_dir/omarchy-audio-cast-$id.ready"
+  pending_unit=$unit
+  pending_ready=$ready
+
+  pending_module=$(pactl load-module module-null-sink \
+    sink_name="$sink" rate=48000 channels=2 \
+    sink_properties="device.description=Wi-Fi device.class=sound")
+  [[ $pending_module =~ ^[0-9]+$ ]] || return 1
+  rm -f -- "$ready" "$cast_volume_state" "$cast_volume_socket"
+
+  systemd-run --user --unit="$unit" --collect --quiet --service-type=exec \
+    --property=KillMode=mixed --property=TimeoutStopSec=12 \
+    --property=Restart=on-failure --property=RestartSec=2 \
+    "$script_dir/cast-stream" \
+    --host "$address" --port "$port" --uuid "$speaker_id" --name "$label" --model "$model" \
+    --source "$sink.monitor" --listen-port "$cast_port" --ready-file "$ready" \
+    --volume-state-file "$cast_volume_state" --volume-socket "$cast_volume_socket"
+
+  for ((attempt = 0; attempt < 600; attempt++)); do
+    [[ ! -e $cancel_file ]] || return 130
+    if [[ -s $ready ]]; then
+      commit_state cast "$unit" "$sink" "$previous" "$speaker_id" "$label" "$pending_module"
+      pactl set-sink-volume "$sink" 100% >/dev/null
+      pactl set-sink-mute "$sink" no >/dev/null
+      select_sink "$sink"
+      route_committed=1
+      return 0
+    fi
+    systemctl --user is-active --quiet "$unit" || break
+    sleep 0.1
+  done
+  return 1
+}
+
+start_airplay() {
+  local speaker_id=$1 label=$2 service_name=$3 host=$4 address=$5 port=$6
+  local transport=$7 encryption_codec=$8 previous=$9
+  local encryption=${encryption_codec%%:*} codec=${encryption_codec#*:}
+  local id sink unit module_args attempt
+
+  [[ $transport =~ ^(tcp|udp)$ ]] || return 2
+  [[ $encryption =~ ^(none|RSA|auth_setup|fp_sap25)$ ]] || return 2
+  [[ $codec =~ ^(PCM|ALAC)$ ]] || return 2
+
+  id=$(safe_id "$speaker_id")
+  [[ -n $id ]] || id=receiver
+  sink="raop_sink.stappmus_wifi_$id"
+  unit="omarchy-audio-raop-$id.service"
+  pending_unit=$unit
+
+  module_args=$(printf '{ raop.ip = "%s" raop.port = %s raop.name = "%s" raop.hostname = "%s" raop.transport = "%s" raop.encryption.type = "%s" raop.audio.codec = "%s" raop.latency.ms = 1500 audio.format = "S16LE" audio.rate = 44100 audio.channels = 2 audio.position = [ FL FR ] node.name = "%s" node.description = "%s" stream.props = { node.autoconnect = false } }' \
+    "$(spa_escape "$address")" "$port" "$(spa_escape "$service_name")" \
+    "$(spa_escape "$host")" "$transport" "$encryption" "$codec" \
+    "$sink" "$(spa_escape "$label")")
+
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+  systemd-run --user --unit="$unit" --collect --quiet --service-type=exec \
+    --property=KillMode=mixed --property=TimeoutStopSec=5 \
+    /usr/bin/pw-cli -m load-module libpipewire-module-raop-sink "$module_args"
+
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    [[ ! -e $cancel_file ]] || return 130
+    if [[ -n $(node_id_for_sink "$sink") ]]; then
+      commit_state raop "$unit" "$sink" "$previous" "$speaker_id" "$label"
+      select_sink "$sink"
+      route_committed=1
+      return 0
+    fi
+    systemctl --user is-active --quiet "$unit" || break
+    sleep 0.1
+  done
+  return 1
+}
+
+connect_speaker() {
+  local kind=$1 previous
+  shift
+
+  if load_state; then
+    previous=$state_previous
+    stop_route "$previous"
+  else
+    previous=$(pactl get-default-sink)
+  fi
+
+  case $kind in
+    cast)
+      start_cast "$1" "$2" "$3" "$4" "$5" "$previous"
+      ;;
+    raop)
+      start_airplay "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$previous"
+      ;;
+    *)
+      return 2
+      ;;
+  esac
+}
+
+route_status() {
+  local status=inactive kind=internal default_sink="" ready=""
+
+  if load_state; then
+    kind=$state_kind
+    default_sink=$(pactl get-default-sink 2>/dev/null || true)
+    if [[ $default_sink == "$state_sink" ]]; then
+      if [[ $state_kind == cast ]]; then
+        ready="$runtime_dir/omarchy-audio-cast-$(safe_id "$state_id").ready"
+        if [[ -s $ready ]]; then
+          status=connected
+        elif systemctl --user is-active --quiet "$state_unit"; then
+          status=reconnecting
+        else
+          status=failed
+        fi
+      elif systemctl --user is-active --quiet "$state_unit"; then
+        status=connected
+      else
+        status=failed
+      fi
+    else
+      status=inactive
+      kind=internal
+    fi
+  fi
+
+  jq -cn \
+    --arg status "$status" \
+    --arg kind "$kind" \
+    --arg sink "${state_sink:-}" \
+    --arg previous "${state_previous:-}" \
+    --arg speakerId "${state_id:-}" \
+    --arg label "${state_label:-}" \
+    '{schemaVersion:1,status:$status,kind:$kind,sink:$sink,previous:$previous,speakerId:$speakerId,label:$label}'
+}
+
+mkdir -p "$runtime_dir"
+exec 9>"$lock_file"
+command=${1:-}
+
+case $command in
+  disconnect)
+    touch "$cancel_file"
+    flock --timeout 65 9
+    stop_route "${2:-}"
+    rm -f -- "$cancel_file"
+    ;;
+  connect)
+    kind=${2:-}
+    if [[ $kind == cast ]]; then
+      [[ $# -eq 7 && ${6:-} =~ ^[0-9]+$ ]] || {
+        echo "Usage: audio-route connect cast SPEAKER_ID LABEL ADDRESS PORT MODEL" >&2
+        exit 2
+      }
+    elif [[ $kind == raop ]]; then
+      [[ $# -eq 11 && ${8:-} =~ ^[0-9]+$ ]] || {
+        echo "Usage: audio-route connect raop SPEAKER_ID LABEL SERVICE HOST ADDRESS PORT TRANSPORT ENCRYPTION:CODEC MODEL" >&2
+        exit 2
+      }
+    else
+      echo "Unknown Wi-Fi audio protocol: $kind" >&2
+      exit 2
+    fi
+    flock --timeout 65 9
+    rm -f -- "$cancel_file"
+    connect_speaker "$kind" "${@:3}"
+    ;;
+  status)
+    route_status
+    ;;
+  *)
+    echo "Usage: audio-route <connect ...|disconnect [SINK_NAME]|status>" >&2
+    exit 2
+    ;;
+esac

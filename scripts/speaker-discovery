@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+
+"""Maintain the runtime cache used by Omarchy's Wi-Fi speaker menu."""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import signal
+import subprocess
+import tempfile
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+CACHE_DIR = RUNTIME_DIR / "omarchy-wifi-speakers"
+CACHE_FILE = CACHE_DIR / "speakers.tsv"
+STATUS_FILE = CACHE_DIR / "status"
+SNAPSHOT_FILE = CACHE_DIR / "snapshot.json"
+SERVICE_TYPES = ("_googlecast._tcp", "_raop._tcp")
+ESCAPED_BYTE = re.compile(r"\\([0-9]{3})")
+NETWORK_CHECK_INTERVAL_SECONDS = 10.0
+RECONCILE_INTERVAL_SECONDS = 30.0
+MAX_EVENT_WAIT_SECONDS = 1.0
+
+stopping = False
+
+
+@dataclass(frozen=True)
+class Speaker:
+    speaker_id: str
+    label: str
+    protocol: str
+    service_name: str
+    host: str
+    address: str
+    port: str
+    transport: str
+    encryption_codec: str
+    model: str
+
+    def tsv(self) -> str:
+        fields = (
+            self.speaker_id,
+            self.label,
+            self.protocol,
+            self.service_name,
+            self.host,
+            self.address,
+            self.port,
+            self.transport,
+            self.encryption_codec,
+            self.model,
+        )
+        return "\t".join(clean_field(field) for field in fields)
+
+
+published_status = "scanning"
+published_speakers: list[Speaker] = []
+
+
+def clean_field(value: str) -> str:
+    return value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
+
+def decode_avahi(value: str) -> str:
+    """Decode Avahi's parseable decimal byte escapes as UTF-8."""
+    decoded = bytearray()
+    cursor = 0
+    for match in ESCAPED_BYTE.finditer(value):
+        decoded.extend(value[cursor : match.start()].encode("utf-8"))
+        decoded.append(int(match.group(1)))
+        cursor = match.end()
+    decoded.extend(value[cursor:].encode("utf-8"))
+    return decoded.decode("utf-8", errors="replace")
+
+
+def txt_value(txt: str, key: str) -> str:
+    match = re.search(rf'"{re.escape(key)}=([^\"]*)"', txt)
+    return decode_avahi(match.group(1)) if match else ""
+
+
+def atomic_write(path: Path, contents: str) -> None:
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=CACHE_DIR)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+            temporary.write(contents)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, path)
+    finally:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+
+
+def publish_status(status: str) -> None:
+    global published_status
+    if (
+        status == published_status
+        and STATUS_FILE.is_file()
+        and SNAPSHOT_FILE.is_file()
+    ):
+        return
+    published_status = status
+    atomic_write(STATUS_FILE, f"{status}\n")
+    publish_snapshot()
+
+
+def publish_snapshot() -> None:
+    speakers = [
+        {
+            "speakerId": speaker.speaker_id,
+            "label": speaker.label,
+            "protocol": speaker.protocol,
+            "serviceName": speaker.service_name,
+            "host": speaker.host,
+            "address": speaker.address,
+            "port": speaker.port,
+            "transport": speaker.transport,
+            "encryptionCodec": speaker.encryption_codec,
+            "model": speaker.model,
+        }
+        for speaker in published_speakers
+    ]
+    contents = json.dumps(
+        {"schemaVersion": 1, "status": published_status, "speakers": speakers},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    atomic_write(SNAPSHOT_FILE, f"{contents}\n")
+
+
+def publish_speakers(records: dict[tuple[str, ...], Speaker]) -> None:
+    global published_speakers
+    # Suppress AirPlay only when Cast exists at the same address. Keep every
+    # Cast service: groups and virtual targets may legitimately share an IP.
+    cast_addresses = {
+        speaker.address for speaker in records.values() if speaker.protocol == "cast"
+    }
+    speakers = [
+        speaker
+        for speaker in records.values()
+        if not (speaker.protocol == "raop" and speaker.address in cast_addresses)
+    ]
+    speakers.sort(key=lambda item: (item.label.casefold(), item.protocol, item.speaker_id))
+    if (
+        speakers == published_speakers
+        and CACHE_FILE.is_file()
+        and SNAPSHOT_FILE.is_file()
+    ):
+        return
+    published_speakers = speakers
+    contents = "".join(f"{speaker.tsv()}\n" for speaker in speakers)
+    atomic_write(CACHE_FILE, contents)
+    publish_snapshot()
+
+
+def begin_generation() -> None:
+    """Publish a single coherent empty/scanning generation transition."""
+    global published_status, published_speakers
+    published_status = "scanning"
+    published_speakers = []
+    atomic_write(CACHE_FILE, "")
+    atomic_write(STATUS_FILE, "scanning\n")
+    publish_snapshot()
+
+
+def speaker_from_fields(fields: list[str]) -> Speaker | None:
+    if len(fields) < 10 or fields[0] != "=" or fields[2] != "IPv4":
+        return None
+
+    _, _, _, encoded_name, service_type, _, encoded_host, address, port, txt = fields
+    if not address or not port:
+        return None
+
+    service_name = decode_avahi(encoded_name)
+    host = decode_avahi(encoded_host)
+
+    if service_type == "_googlecast._tcp":
+        speaker_id = txt_value(txt, "id") or service_name
+        label = txt_value(txt, "fn") or service_name
+        model = txt_value(txt, "md") or "Google Cast speaker"
+        return Speaker(
+            speaker_id,
+            label,
+            "cast",
+            service_name,
+            host,
+            address,
+            port,
+            "-",
+            "-",
+            model,
+        )
+
+    if service_type == "_raop._tcp":
+        speaker_id, separator, label = service_name.partition("@")
+        if not separator:
+            speaker_id = label = service_name
+        transports = txt_value(txt, "tp").split(",")
+        encryptions = txt_value(txt, "et").split(",")
+        codecs = txt_value(txt, "cn").split(",")
+        model = txt_value(txt, "am") or "AirPlay speaker"
+        transport = "udp" if "UDP" in transports else "tcp"
+        if "5" in encryptions:
+            encryption = "fp_sap25"
+        elif "4" in encryptions:
+            encryption = "auth_setup"
+        elif "1" in encryptions:
+            encryption = "RSA"
+        else:
+            encryption = "none"
+        codec = "PCM" if "0" in codecs else "ALAC"
+        return Speaker(
+            speaker_id,
+            label,
+            "raop",
+            service_name,
+            host,
+            address,
+            port,
+            transport,
+            f"{encryption}:{codec}",
+            model,
+        )
+
+    return None
+
+
+def service_key(fields: list[str]) -> tuple[str, ...] | None:
+    if len(fields) < 6:
+        return None
+    return tuple(fields[1:6])
+
+
+def apply_browser_event(
+    line: str,
+    records: dict[tuple[str, ...], Speaker],
+) -> bool:
+    fields = line.rstrip("\n").split(";", 9)
+    key = service_key(fields)
+    if key is None:
+        return False
+    if fields[0] == "-":
+        return records.pop(key, None) is not None
+    if fields[0] != "=":
+        return False
+    speaker = speaker_from_fields(fields)
+    if speaker is None or records.get(key) == speaker:
+        return False
+    records[key] = speaker
+    return True
+
+
+def network_signature() -> str:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/ip", "-o", "-4", "address", "show", "scope", "global", "up"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    # `ip` also prints DHCP lifetimes, which tick down every second. Only the
+    # interface and address/prefix identify a network change.
+    addresses = []
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 4 and fields[2] == "inet":
+            addresses.append(f"{fields[1]} {fields[3]}")
+    return "\n".join(sorted(addresses))
+
+
+def start_browsers() -> list[subprocess.Popen[str]]:
+    browsers: list[subprocess.Popen[str]] = []
+    for service_type in SERVICE_TYPES:
+        browsers.append(
+            subprocess.Popen(
+                [
+                    "/usr/bin/avahi-browse",
+                    "--resolve",
+                    "--parsable",
+                    "--no-db-lookup",
+                    "--no-fail",
+                    service_type,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+        )
+    return browsers
+
+
+def stop_browsers(browsers: list[subprocess.Popen[str]]) -> None:
+    for browser in browsers:
+        if browser.poll() is None:
+            browser.terminate()
+    deadline = time.monotonic() + 2
+    for browser in browsers:
+        if browser.poll() is not None:
+            continue
+        try:
+            browser.wait(timeout=max(0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            browser.kill()
+    for browser in browsers:
+        browser.wait()
+
+
+def read_browser(browser: subprocess.Popen[str], events: queue.Queue[str | None]) -> None:
+    assert browser.stdout is not None
+    for line in browser.stdout:
+        events.put(line)
+    events.put(None)
+
+
+def snapshot_records(timeout: float = 3.0) -> dict[tuple[str, ...], Speaker] | None:
+    """Reconcile against Avahi's targeted cache without blocking the menu."""
+    browsers: list[subprocess.Popen[str]] = []
+    try:
+        for service_type in SERVICE_TYPES:
+            browsers.append(
+                subprocess.Popen(
+                    [
+                        "/usr/bin/avahi-browse",
+                        "--cache",
+                        "--resolve",
+                        "--parsable",
+                        "--no-db-lookup",
+                        service_type,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            )
+    except OSError:
+        stop_browsers(browsers)
+        return None
+
+    outputs: list[str] = []
+    deadline = time.monotonic() + timeout
+    try:
+        for browser in browsers:
+            output, _ = browser.communicate(timeout=max(0.1, deadline - time.monotonic()))
+            if browser.returncode != 0:
+                return None
+            outputs.append(output)
+    except subprocess.TimeoutExpired:
+        return None
+    finally:
+        stop_browsers(browsers)
+
+    records: dict[tuple[str, ...], Speaker] = {}
+    for output in outputs:
+        for line in output.splitlines():
+            fields = line.split(";", 9)
+            key = service_key(fields)
+            speaker = speaker_from_fields(fields)
+            if key is not None and speaker is not None:
+                records[key] = speaker
+    return records
+
+
+def run_generation(signature: str) -> str:
+    records: dict[tuple[str, ...], Speaker] = {}
+    # Clear the previous network's generation before advertising scanning.
+    # Consumers can then reveal new rows progressively without flashing a
+    # cached speaker from the old network.
+    begin_generation()
+
+    try:
+        browsers = start_browsers()
+    except OSError:
+        publish_status("error")
+        time.sleep(2)
+        return network_signature()
+
+    events: queue.Queue[str | None] = queue.Queue()
+    for browser in browsers:
+        threading.Thread(target=read_browser, args=(browser, events), daemon=True).start()
+
+    now = time.monotonic()
+    initial_snapshot = snapshot_records()
+    if initial_snapshot is None:
+        # `--no-fail` keeps the continuous browsers alive while Avahi is down;
+        # do not misreport that waiting state as a completed empty scan.
+        publish_status("error")
+        ready_at = 0.0
+        next_reconcile = now + 2.0
+    else:
+        records = initial_snapshot
+        publish_speakers(records)
+        if records:
+            publish_status("ready")
+            ready_at = 0.0
+        else:
+            # Give newly announced services a short window to resolve before
+            # declaring that a healthy Avahi cache is empty.
+            ready_at = now + 1.0
+        next_reconcile = now + RECONCILE_INTERVAL_SECONDS
+
+    next_network_check = now + NETWORK_CHECK_INTERVAL_SECONDS
+    failed = False
+    try:
+        while not stopping:
+            deadlines = [next_network_check, next_reconcile]
+            if ready_at:
+                deadlines.append(ready_at)
+            event_wait = max(
+                0.05,
+                min(MAX_EVENT_WAIT_SECONDS, min(deadlines) - time.monotonic()),
+            )
+            try:
+                line = events.get(timeout=event_wait)
+            except queue.Empty:
+                line = ""
+
+            records_changed = False
+            if line is None:
+                failed = True
+            elif line:
+                records_changed = apply_browser_event(line, records)
+
+            # Drain an entire event burst. Text streams can buffer lines after
+            # the underlying file descriptor is no longer marked readable.
+            while not failed:
+                try:
+                    line = events.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    failed = True
+                    break
+                records_changed = apply_browser_event(line, records) or records_changed
+
+            if records_changed:
+                publish_speakers(records)
+
+            if failed:
+                break
+
+            now = time.monotonic()
+            if ready_at and now >= ready_at:
+                publish_status("ready")
+                ready_at = 0
+
+            if now >= next_network_check:
+                new_signature = network_signature()
+                if new_signature != signature:
+                    return new_signature
+                next_network_check = now + NETWORK_CHECK_INTERVAL_SECONDS
+
+            if now >= next_reconcile:
+                snapshot = snapshot_records()
+                if snapshot is None:
+                    publish_status("error")
+                    next_reconcile = time.monotonic() + 2.0
+                else:
+                    if snapshot != records:
+                        records = snapshot
+                        publish_speakers(records)
+                    publish_status("ready")
+                    ready_at = 0.0
+                    next_reconcile = time.monotonic() + RECONCILE_INTERVAL_SECONDS
+
+            if any(browser.poll() is not None for browser in browsers):
+                failed = True
+                break
+    finally:
+        stop_browsers(browsers)
+
+    if failed and not stopping:
+        publish_status("error")
+        time.sleep(2)
+    return network_signature()
+
+
+def request_stop(_signum: int, _frame: object) -> None:
+    global stopping
+    stopping = True
+
+
+def main() -> int:
+    CACHE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(CACHE_DIR, 0o700)
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+
+    signature = network_signature()
+    while not stopping:
+        signature = run_generation(signature)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "id": "stappmus.wifi-speakers",
+  "name": "Wi-Fi Speakers",
+  "version": "1.0.0",
+  "author": "Kristoffer Haugland",
+  "license": "MIT",
+  "description": "Live-discovered Google Cast and AirPlay audio output selector for Omarchy Quattro",
+  "kinds": [
+    "overlay"
+  ],
+  "entryPoints": {
+    "overlay": "WifiSpeakers.qml"
+  }
+}

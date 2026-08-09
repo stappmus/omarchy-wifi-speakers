@@ -1,0 +1,66 @@
+#!/usr/bin/python
+
+# omarchy:summary=Control the active Google Cast receiver volume
+# omarchy:group=audio
+# omarchy:args=<get|set LEVEL|raise|lower|mute-toggle|mute-set BOOLEAN|+N|-N>
+
+"""Send a volume command to the active Omarchy Cast bridge."""
+
+import argparse
+import json
+import os
+import socket
+import sys
+from pathlib import Path
+
+
+def request_for(action: str, value: str | None) -> dict[str, object]:
+    if action == "get":
+        return {"action": "get"}
+    if action == "set":
+        if value is None:
+            raise ValueError("set requires a volume between 0 and 1")
+        return {"action": "set", "value": float(value)}
+    if action == "mute-toggle":
+        return {"action": "mute-toggle"}
+    if action == "mute-set":
+        normalized = str(value or "").lower()
+        if normalized not in {"true", "false"}:
+            raise ValueError("mute-set requires true or false")
+        return {"action": "mute", "value": normalized == "true"}
+    if action == "raise":
+        action = "+5"
+    elif action == "lower":
+        action = "-5"
+    if action.startswith(("+", "-")):
+        return {"action": "adjust", "value": float(action) / 100, "unmute": True}
+    raise ValueError("unknown volume action")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("action")
+    parser.add_argument("value", nargs="?")
+    args = parser.parse_args()
+
+    runtime_dir = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}"))
+    socket_path = runtime_dir / "omarchy-audio-cast-volume.sock"
+
+    try:
+        request = request_for(args.action, args.value)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(2)
+            client.connect(str(socket_path))
+            client.sendall((json.dumps(request) + "\n").encode("utf-8"))
+            response = json.loads(client.makefile("r", encoding="utf-8").readline())
+        if "error" in response:
+            raise RuntimeError(str(response["error"]))
+        print(json.dumps(response))
+        return 0
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"Cast volume control failed: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,4 @@
+#!/bin/bash
+
+# Compatibility entry point for pre-plugin Wi-Fi speaker keybindings.
+exec "$HOME/.config/omarchy/plugins/stappmus.wifi-speakers/scripts/audio-output" "$@"

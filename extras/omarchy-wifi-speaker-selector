@@ -1,0 +1,4 @@
+#!/bin/bash
+
+# Compatibility entry point for the original local selector binding.
+exec "$HOME/.config/omarchy/plugins/stappmus.wifi-speakers/scripts/open-overlay" "$@"

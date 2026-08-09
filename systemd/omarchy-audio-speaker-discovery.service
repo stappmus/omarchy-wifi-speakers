@@ -1,0 +1,14 @@
+[Unit]
+Description=Discover Wi-Fi speakers for the Omarchy audio selector
+
+[Service]
+Type=simple
+RuntimeDirectory=omarchy-wifi-speakers
+RuntimeDirectoryMode=0700
+ExecStartPre=/usr/bin/rm -f %t/omarchy-wifi-speakers/status %t/omarchy-wifi-speakers/speakers.tsv %t/omarchy-wifi-speakers/snapshot.json
+ExecStart=%h/.config/omarchy/plugins/stappmus.wifi-speakers/scripts/speaker-discovery
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
