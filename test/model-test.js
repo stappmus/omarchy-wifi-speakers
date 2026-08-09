@@ -39,11 +39,50 @@ assert.equal(Model.isAirPlaySink(airPlaySink), true)
 assert.equal(Model.isAirPlaySink(localSink), false)
 assert.equal(Model.nativeSinkMatchesSpeaker(airPlaySink, matchingCast), true)
 assert.deepEqual(Model.filterWifiSpeakers([matchingCast, otherCast], [airPlaySink]), [matchingCast, otherCast])
+assert.equal(Model.speakersShareReceiver(matchingAirPlay, matchingCast), true)
+assert.equal(Model.speakersShareReceiver(matchingAirPlay, {...matchingCast, address: "192.168.50.119"}), false)
+assert.deepEqual(Model.filterWifiSpeakers([matchingAirPlay, matchingCast], []), [matchingCast])
 assert.deepEqual(Model.filterWifiSpeakers([matchingAirPlay], [airPlaySink]), [])
 assert.deepEqual(Model.filterWifiSpeakers([matchingCast], [localSink]), [matchingCast])
 assert.equal(Model.castSpeakerForNativeSink([matchingCast, otherCast], airPlaySink), matchingCast)
 assert.equal(Model.castSpeakerForNativeSink([otherCast], airPlaySink), null)
+const remembered = Model.rememberCastSpeakers([matchingCast], [otherCast])
+assert.deepEqual(remembered, [otherCast, matchingCast])
+assert.deepEqual(
+  Model.rememberedCastReconnectKeys([], remembered, [airPlaySink]),
+  ["cast:cast-id"]
+)
+const reconnecting = Model.wifiSpeakerCandidates([], remembered, [airPlaySink], true)
+assert.equal(reconnecting.length, 1)
+assert.equal(reconnecting[0].speakerId, matchingCast.speakerId)
+assert.equal(reconnecting[0].available, false)
+assert.equal(reconnecting[0].reconnecting, true)
+const transientDualProtocol = Model.wifiSpeakerCandidates(
+  [matchingAirPlay],
+  remembered,
+  [airPlaySink],
+  true
+)
+assert.deepEqual(
+  Model.filterWifiSpeakers(transientDualProtocol, []),
+  [transientDualProtocol[1]]
+)
+assert.deepEqual(
+  Model.wifiSpeakerCandidates([], remembered, [airPlaySink], false),
+  []
+)
+assert.deepEqual(
+  Model.filterWifiSpeakers(
+    Model.wifiSpeakerCandidates([matchingAirPlay], remembered, [airPlaySink], false),
+    [airPlaySink]
+  ),
+  []
+)
+assert.deepEqual(
+  Model.wifiSpeakerCandidates([matchingCast], remembered, [airPlaySink], true),
+  [matchingCast]
+)
 assert.equal(Model.wifiSinkName("AB-CD", "cast"), "omarchy_wifi_cast_abcd")
 assert.equal(Model.wifiSinkName("AB-CD", "raop"), "raop_sink.stappmus_wifi_abcd")
 
-console.log("ok - dual-protocol receivers prefer one stable Cast-backed row")
+console.log("ok - dual-protocol receivers stay stable across Wi-Fi reconnects")

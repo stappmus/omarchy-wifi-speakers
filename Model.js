@@ -100,6 +100,21 @@ function nativeSinkMatchesSpeaker(node, speaker) {
   return speakerLabel !== "" && speakerLabel === sinkLabel
 }
 
+function speakersShareReceiver(first, second) {
+  if (!first || !second) return false
+  var firstAddress = String(first.address || "").trim().toLowerCase()
+  var secondAddress = String(second.address || "").trim().toLowerCase()
+  if (firstAddress && secondAddress) return firstAddress === secondAddress
+
+  var firstHost = String(first.host || "").trim().toLowerCase().replace(/\.$/, "")
+  var secondHost = String(second.host || "").trim().toLowerCase().replace(/\.$/, "")
+  if (firstHost && secondHost) return firstHost === secondHost
+
+  var firstLabel = friendlyDeviceLabel(first.label || "").toLowerCase()
+  var secondLabel = friendlyDeviceLabel(second.label || "").toLowerCase()
+  return firstLabel !== "" && firstLabel === secondLabel
+}
+
 function filterWifiSpeakers(speakers, sinks) {
   var values = Array.isArray(speakers) ? speakers : []
   var nativeSinks = Array.isArray(sinks) ? sinks : []
@@ -113,7 +128,16 @@ function filterWifiSpeakers(speakers, sinks) {
       continue
     }
     var represented = false
+    for (var castIndex = 0; castIndex < values.length; castIndex++) {
+      var castSpeaker = values[castIndex]
+      if (String(castSpeaker && castSpeaker.protocol || "").toLowerCase() === "cast"
+          && speakersShareReceiver(speaker, castSpeaker)) {
+        represented = true
+        break
+      }
+    }
     for (var j = 0; j < nativeSinks.length; j++) {
+      if (represented) break
       if (nativeSinkMatchesSpeaker(nativeSinks[j], speaker)) {
         represented = true
         break
@@ -132,6 +156,85 @@ function castSpeakerForNativeSink(speakers, node) {
         && nativeSinkMatchesSpeaker(node, speaker)) return speaker
   }
   return null
+}
+
+function wifiSpeakerKey(speaker) {
+  if (!speaker || !speaker.speakerId) return ""
+  return String(speaker.protocol || "cast").toLowerCase()
+    + ":" + String(speaker.speakerId)
+}
+
+function rememberCastSpeakers(speakers, remembered) {
+  var current = Array.isArray(speakers) ? speakers : []
+  var previous = Array.isArray(remembered) ? remembered : []
+  var result = []
+  var indexes = {}
+
+  function add(speaker) {
+    if (String(speaker && speaker.protocol || "").toLowerCase() !== "cast") return
+    var key = wifiSpeakerKey(speaker)
+    if (!key) return
+    if (indexes[key] !== undefined) result[indexes[key]] = speaker
+    else {
+      indexes[key] = result.length
+      result.push(speaker)
+    }
+  }
+
+  for (var i = 0; i < previous.length; i++) add(previous[i])
+  for (var j = 0; j < current.length; j++) add(current[j])
+  return result
+}
+
+function rememberedCastReconnectKeys(speakers, remembered, nodes) {
+  var current = Array.isArray(speakers) ? speakers : []
+  var previous = Array.isArray(remembered) ? remembered : []
+  var nativeSinks = Array.isArray(nodes) ? nodes : []
+  var present = {}
+  var keys = []
+
+  for (var i = 0; i < current.length; i++) {
+    var currentKey = wifiSpeakerKey(current[i])
+    if (currentKey) present[currentKey] = true
+  }
+
+  for (var j = 0; j < previous.length; j++) {
+    var speaker = previous[j]
+    var key = wifiSpeakerKey(speaker)
+    if (!key || present[key]) continue
+    for (var k = 0; k < nativeSinks.length; k++) {
+      var node = nativeSinks[k]
+      var name = String(node && node.name || "")
+      if (name.indexOf("raop_sink.stappmus_wifi_") === 0) continue
+      if (nativeSinkMatchesSpeaker(node, speaker)) {
+        keys.push(key)
+        break
+      }
+    }
+  }
+  return keys
+}
+
+function wifiSpeakerCandidates(speakers, remembered, nodes, includeRemembered) {
+  var current = Array.isArray(speakers) ? speakers : []
+  var previous = Array.isArray(remembered) ? remembered : []
+  var reconnecting = rememberedCastReconnectKeys(current, previous, nodes)
+  var reconnectingSet = {}
+  var result = current.slice()
+
+  if (includeRemembered === false) return result
+  for (var i = 0; i < reconnecting.length; i++) reconnectingSet[reconnecting[i]] = true
+  for (var j = 0; j < previous.length; j++) {
+    var speaker = previous[j]
+    var key = wifiSpeakerKey(speaker)
+    if (!reconnectingSet[key]) continue
+    var placeholder = {}
+    for (var field in speaker) placeholder[field] = speaker[field]
+    placeholder.available = false
+    placeholder.reconnecting = true
+    result.push(placeholder)
+  }
+  return result
 }
 
 function wifiSinkName(speakerId, protocol) {
@@ -318,8 +421,13 @@ if (typeof module !== "undefined") {
     nodeLabel: nodeLabel,
     isAirPlaySink: isAirPlaySink,
     nativeSinkMatchesSpeaker: nativeSinkMatchesSpeaker,
+    speakersShareReceiver: speakersShareReceiver,
     filterWifiSpeakers: filterWifiSpeakers,
     castSpeakerForNativeSink: castSpeakerForNativeSink,
+    wifiSpeakerKey: wifiSpeakerKey,
+    rememberCastSpeakers: rememberCastSpeakers,
+    rememberedCastReconnectKeys: rememberedCastReconnectKeys,
+    wifiSpeakerCandidates: wifiSpeakerCandidates,
     wifiSinkName: wifiSinkName,
     isHeadphones: isHeadphones,
     sinkGlyph: sinkGlyph,

@@ -12,6 +12,7 @@ so switching rooms or devices feels like using any other audio output.
 - Google Cast outputs directly in the Audio panel.
 - Automatic discovery on your local network.
 - One stable entry per receiver when a device supports both AirPlay and Cast.
+- Stable receiver identity while Wi-Fi disconnects and reconnects.
 - Volume, microphone, and per-application controls from Omarchy's regular Audio
   widget.
 - Automatic restoration of your previous output when leaving a Cast route.
@@ -54,6 +55,8 @@ receivers appear in the **Output** list:
 - AirPlay-only receivers behave like normal PipeWire outputs.
 - Receivers that advertise Cast use the managed Cast route. If the same device
   also advertises AirPlay, the two protocols are merged into one row.
+- During a network reconnect, a known dual-protocol receiver waits briefly for
+  Cast discovery instead of appearing first as a separate AirPlay output.
 - Selecting a local output ends the active network route and returns playback
   to that device.
 

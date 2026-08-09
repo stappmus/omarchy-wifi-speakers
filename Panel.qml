@@ -31,6 +31,8 @@ Panel {
   readonly property string castVolumeStatePath: runtimeDir + "/omarchy-audio-cast-volume.json"
 
   property var discoveredWifiSpeakers: []
+  property var rememberedCastSpeakers: []
+  property bool castReconnectGraceExpired: false
   property var displayWifiSpeakers: []
   property string wifiRouteError: ""
   property string wifiRouteStatus: "inactive"
@@ -38,12 +40,24 @@ Panel {
   property var pendingDefaultSink: null
   property bool wifiRouteCancelRequested: false
 
+  readonly property var pendingCastReconnects: Model.rememberedCastReconnectKeys(
+    discoveredWifiSpeakers,
+    rememberedCastSpeakers,
+    nodes
+  )
+  readonly property var wifiSpeakerCandidates: Model.wifiSpeakerCandidates(
+    discoveredWifiSpeakers,
+    rememberedCastSpeakers,
+    nodes,
+    !castReconnectGraceExpired
+  )
+
   readonly property var wifiSpeakers: {
-    var filtered = Model.filterWifiSpeakers(discoveredWifiSpeakers, rawAudioSinks)
+    var filtered = Model.filterWifiSpeakers(wifiSpeakerCandidates, rawAudioSinks)
     if (!isManagedWifiSink(sink)) return filtered
     var sinkName = String(sink.name || "")
-    for (var i = 0; i < discoveredWifiSpeakers.length; i++) {
-      var speaker = discoveredWifiSpeakers[i]
+    for (var i = 0; i < wifiSpeakerCandidates.length; i++) {
+      var speaker = wifiSpeakerCandidates[i]
       if (wifiSinkName(speaker.speakerId, speaker.protocol) !== sinkName) continue
       for (var j = 0; j < filtered.length; j++)
         if (filtered[j] === speaker) return filtered
@@ -199,6 +213,11 @@ Panel {
 
   onRawAudioSinksChanged: if (rawAudioSinks.length > 0) cachedAudioSinks = rawAudioSinks
   onRawAudioSourcesChanged: if (rawAudioSources.length > 0) cachedAudioSources = rawAudioSources
+  onPendingCastReconnectsChanged: {
+    castReconnectGraceExpired = false
+    if (pendingCastReconnects.length > 0) castReconnectGraceTimer.restart()
+    else castReconnectGraceTimer.stop()
+  }
   onWifiSpeakersChanged: scheduleDisplayAudioModelRefresh()
   onCastOutputActiveChanged: {
     if (castOutputActive) castVolumeStateFile.reload()
@@ -608,7 +627,7 @@ Panel {
   }
 
   function castSpeakerForNativeSink(node) {
-    return Model.castSpeakerForNativeSink(discoveredWifiSpeakers, node)
+    return Model.castSpeakerForNativeSink(wifiSpeakerCandidates, node)
   }
 
   function isShadowedNativeSink(node) {
@@ -662,6 +681,10 @@ Panel {
         }
       }
 
+      rememberedCastSpeakers = Model.rememberCastSpeakers(
+        speakers,
+        rememberedCastSpeakers
+      )
       discoveredWifiSpeakers = speakers
     } catch (_error) {
       return
@@ -916,6 +939,13 @@ Panel {
     printErrors: false
     onLoaded: root.applyCastVolumeState(text())
     onFileChanged: reload()
+  }
+
+  Timer {
+    id: castReconnectGraceTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.castReconnectGraceExpired = true
   }
 
   Timer {
@@ -1434,6 +1464,7 @@ Panel {
     readonly property bool isInitializing: root.initializingOutputKey === root.wifiOutputKey(speaker)
     readonly property string statusLabel: {
       if (isInitializing) return "Initializing…"
+      if (speaker.reconnecting === true) return "Discovering…"
       if (isActive && root.wifiRouteStatus === "reconnecting") return "Reconnecting…"
       if (isActive && root.wifiRouteStatus === "failed") return "Connection lost"
       return ""
