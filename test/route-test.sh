@@ -11,8 +11,10 @@ stub_dir="$test_tmp/bin"
 runtime_dir="$test_tmp/runtime"
 route_log="$test_tmp/route.log"
 default_sink_file="$test_tmp/default-sink"
+pw_dump_count_file="$test_tmp/pw-dump-count"
 mkdir -p "$stub_dir" "$runtime_dir"
 printf 'omarchy_speaker_tuning\n' >"$default_sink_file"
+printf '0\n' >"$pw_dump_count_file"
 : >"$route_log"
 
 cat >"$stub_dir/pactl" <<'STUB'
@@ -31,6 +33,14 @@ STUB
 
 cat >"$stub_dir/pw-dump" <<'STUB'
 #!/bin/bash
+count=0
+[[ -r $TEST_PW_DUMP_COUNT ]] && read -r count <"$TEST_PW_DUMP_COUNT"
+count=$((count + 1))
+printf '%s\n' "$count" >"$TEST_PW_DUMP_COUNT"
+if ((count <= ${TEST_PW_DUMP_FAILS:-0})); then
+  printf '[]\n'
+  exit 0
+fi
 cat <<'JSON'
 [
   {"id":1,"type":"PipeWire:Interface:Node","info":{"props":{"node.name":"omarchy_speaker_tuning"}}},
@@ -69,6 +79,8 @@ route_env=(
   XDG_RUNTIME_DIR="$runtime_dir"
   TEST_ROUTE_LOG="$route_log"
   TEST_DEFAULT_SINK_FILE="$default_sink_file"
+  TEST_PW_DUMP_COUNT="$pw_dump_count_file"
+  TEST_PW_DUMP_FAILS=2
   PATH="$stub_dir:$PATH"
 )
 
@@ -77,6 +89,7 @@ cast_sink=omarchy_wifi_cast_12345678123412341234123456789abc
 env "${route_env[@]}" "$route" connect cast \
   "$speaker_id" "Living Room" 192.168.1.20 8009 "Nest Audio"
 grep -Fxq "$cast_sink" "$default_sink_file"
+(( $(<"$pw_dump_count_file") >= 3 ))
 grep -Fq $'cast\tomarchy-audio-cast-12345678123412341234123456789abc.service' \
   "$runtime_dir/omarchy-audio-wifi.state"
 status=$(env "${route_env[@]}" "$route" status)

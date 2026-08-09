@@ -11,7 +11,7 @@ so switching rooms or devices feels like using any other audio output.
 - AirPlay outputs through PipeWire's native RAOP support.
 - Google Cast outputs directly in the Audio panel.
 - Automatic discovery on your local network.
-- One entry per receiver when a device supports both AirPlay and Cast.
+- One stable entry per receiver when a device supports both AirPlay and Cast.
 - Volume, microphone, and per-application controls from Omarchy's regular Audio
   widget.
 - Automatic restoration of your previous output when leaving a Cast route.
@@ -51,8 +51,9 @@ PipeWire configuration or systemd units.
 Open Audio by clicking the volume icon or pressing `SUPER + CTRL + A`. Available
 receivers appear in the **Output** list:
 
-- AirPlay receivers behave like normal PipeWire outputs.
-- Cast-only receivers appear with a **Google Cast** subtitle.
+- AirPlay-only receivers behave like normal PipeWire outputs.
+- Receivers that advertise Cast use the managed Cast route. If the same device
+  also advertises AirPlay, the two protocols are merged into one row.
 - Selecting a local output ends the active network route and returns playback
   to that device.
 
@@ -109,9 +110,10 @@ Audio panel watches that cache instead of scanning the network itself.
 
 When you choose a Cast receiver, the plugin creates a temporary PipeWire sink,
 moves real application streams to it, and serves the sink monitor only to the
-selected receiver. Volume commands travel over a local Unix socket. Returning
-to a local output removes the temporary route and restores the exact output
-that was active before it.
+selected receiver. It also adopts that sink as Omarchy's configured output so
+the local speakers do not reclaim playback after connection. Volume commands
+travel over a local Unix socket. Returning to a local output removes the
+temporary route and restores the exact output that was active before it.
 
 Runtime state, control sockets, and the receiver cache live under the user's
 runtime directory.

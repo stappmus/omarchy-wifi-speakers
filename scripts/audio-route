@@ -55,6 +55,16 @@ select_sink() {
   omarchy-audio-output-set-default "$node_id" "$sink"
 }
 
+select_sink_when_ready() {
+  local sink=$1 attempts=${2:-8} attempt
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    select_sink "$sink" && return 0
+    [[ ! -e $cancel_file ]] || return 130
+    sleep 0.15
+  done
+  return 1
+}
+
 load_state() {
   state_kind=""
   state_unit=""
@@ -173,7 +183,7 @@ start_cast() {
       commit_state cast "$unit" "$sink" "$previous" "$speaker_id" "$label" "$pending_module"
       pactl set-sink-volume "$sink" 100% >/dev/null
       pactl set-sink-mute "$sink" no >/dev/null
-      select_sink "$sink"
+      select_sink_when_ready "$sink"
       route_committed=1
       return 0
     fi
@@ -214,7 +224,7 @@ start_airplay() {
     [[ ! -e $cancel_file ]] || return 130
     if [[ -n $(node_id_for_sink "$sink") ]]; then
       commit_state raop "$unit" "$sink" "$previous" "$speaker_id" "$label"
-      select_sink "$sink"
+      select_sink_when_ready "$sink"
       route_committed=1
       return 0
     fi

@@ -60,7 +60,8 @@ Panel {
     var list = []
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i]
-      if (n && n.isSink && !n.isStream && !isManagedWifiSink(n)) list.push(n)
+      if (n && n.isSink && !n.isStream
+          && !isManagedWifiSink(n) && !isShadowedNativeSink(n)) list.push(n)
     }
     return list
   }
@@ -116,7 +117,8 @@ Panel {
     var list = []
     for (var i = 0; i < candidateSinks.length; i++)
       if (sinkAvailable(candidateSinks[i])) list.push(candidateSinks[i])
-    if (sink && !isManagedWifiSink(sink) && list.indexOf(sink) < 0) list.unshift(sink)
+    if (sink && !isManagedWifiSink(sink) && !isShadowedNativeSink(sink)
+        && list.indexOf(sink) < 0) list.unshift(sink)
     return list
   }
 
@@ -173,7 +175,14 @@ Panel {
 
   // Re-resolve whenever the selected output changes; the timer below is only a
   // safety net for the tuning being applied or removed underneath us.
-  onSinkChanged: resolveVolumeSink()
+  onSinkChanged: {
+    resolveVolumeSink()
+    // Quickshell keeps a configured default in addition to PipeWire's current
+    // default. Adopt the managed node as soon as it appears or the old local
+    // preference will reclaim playback a few seconds after Cast connects.
+    if (isManagedWifiSink(sink) && Pipewire.preferredDefaultAudioSink !== sink)
+      Pipewire.preferredDefaultAudioSink = sink
+  }
 
   function resolveVolumeSink() {
     if (!volumeSinkProc.running) volumeSinkProc.running = true
@@ -596,6 +605,14 @@ Panel {
   function isManagedWifiSink(node) {
     var name = node && node.name ? String(node.name) : ""
     return isManagedCastSink(node) || name.indexOf("raop_sink.stappmus_wifi_") === 0
+  }
+
+  function castSpeakerForNativeSink(node) {
+    return Model.castSpeakerForNativeSink(discoveredWifiSpeakers, node)
+  }
+
+  function isShadowedNativeSink(node) {
+    return !!castSpeakerForNativeSink(node)
   }
 
   function applyWifiSnapshot(raw) {
@@ -1410,14 +1427,16 @@ Panel {
     required property var speaker
     required property int rowIndex
 
-    readonly property bool isActive: root.sink
-      && String(root.sink.name || "") === root.wifiSinkName(speaker.speakerId, speaker.protocol)
+    readonly property bool isActive: root.sink && (
+      String(root.sink.name || "") === root.wifiSinkName(speaker.speakerId, speaker.protocol)
+      || root.castSpeakerForNativeSink(root.sink) === speaker
+    )
     readonly property bool isInitializing: root.initializingOutputKey === root.wifiOutputKey(speaker)
     readonly property string statusLabel: {
       if (isInitializing) return "Initializing…"
       if (isActive && root.wifiRouteStatus === "reconnecting") return "Reconnecting…"
       if (isActive && root.wifiRouteStatus === "failed") return "Connection lost"
-      return speaker.protocol === "raop" ? "AirPlay" : "Google Cast"
+      return ""
     }
     hasCursor: root.cursorActive && root.focusSection === "output" && root.selectedIndex === rowIndex
     onHasCursorChanged: if (hasCursor) root.ensureCursorVisible(wifiRow)
@@ -1438,7 +1457,7 @@ Panel {
       spacing: Style.space(8)
 
       Text {
-        text: "󰒋"
+        text: "󰓃"
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.title
@@ -1463,6 +1482,7 @@ Panel {
         }
 
         Text {
+          visible: wifiRow.statusLabel !== ""
           text: wifiRow.statusLabel
           color: Qt.darker(root.bar.foreground, 1.4)
           font.family: root.bar.fontFamily

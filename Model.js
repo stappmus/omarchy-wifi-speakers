@@ -108,6 +108,10 @@ function filterWifiSpeakers(speakers, sinks) {
     var speaker = values[i]
     var protocol = String(speaker && speaker.protocol || "").toLowerCase()
     if (!speaker || (protocol !== "cast" && protocol !== "raop")) continue
+    if (protocol === "cast") {
+      filtered.push(speaker)
+      continue
+    }
     var represented = false
     for (var j = 0; j < nativeSinks.length; j++) {
       if (nativeSinkMatchesSpeaker(nativeSinks[j], speaker)) {
@@ -118,6 +122,16 @@ function filterWifiSpeakers(speakers, sinks) {
     if (!represented) filtered.push(speaker)
   }
   return filtered
+}
+
+function castSpeakerForNativeSink(speakers, node) {
+  var values = Array.isArray(speakers) ? speakers : []
+  for (var i = 0; i < values.length; i++) {
+    var speaker = values[i]
+    if (String(speaker && speaker.protocol || "").toLowerCase() === "cast"
+        && nativeSinkMatchesSpeaker(node, speaker)) return speaker
+  }
+  return null
 }
 
 function wifiSinkName(speakerId, protocol) {
@@ -305,6 +319,7 @@ if (typeof module !== "undefined") {
     isAirPlaySink: isAirPlaySink,
     nativeSinkMatchesSpeaker: nativeSinkMatchesSpeaker,
     filterWifiSpeakers: filterWifiSpeakers,
+    castSpeakerForNativeSink: castSpeakerForNativeSink,
     wifiSinkName: wifiSinkName,
     isHeadphones: isHeadphones,
     sinkGlyph: sinkGlyph,

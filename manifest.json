@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "stappmus.audio",
   "name": "Audio + Wi-Fi",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "author": "Kristoffer Haugland",
   "license": "MIT",
   "description": "Omarchy Audio panel with native AirPlay and Google Cast outputs",
